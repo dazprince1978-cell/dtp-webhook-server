@@ -1,14 +1,10 @@
-// server.js
-// Minimal Shopify webhook server with SEO + auto-pricing
-// Run with: node server.js
-
+// server.js — FIXED: use productVariantUpdate for prices
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
-// --- Config from environment variables ---
-const SHOP = process.env.SHOPIFY_SHOP;         // e.g. "dtpjewellry.myshopify.com"
-const TOKEN = process.env.SHOPIFY_TOKEN;       // Shopify Admin API token
+const SHOP = process.env.SHOPIFY_SHOP;         // dtpjewellry.myshopify.com
+const TOKEN = process.env.SHOPIFY_TOKEN;       // shpat_...
 const API = `https://${SHOP}/admin/api/2024-07/graphql.json`;
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
@@ -16,12 +12,12 @@ const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
 const app = express();
 app.use(bodyParser.json({ type: "*/*" }));
 
-// --- Helpers ---
-const clamp = (s, n) => (s||"").trim().replace(/\s+/g," ").slice(0, n);
+// helpers
+const clamp = (s, n) => (s||"").toString().trim().replace(/\s+/g," ").slice(0, n);
 const round99 = n => (Math.max(0, Math.round(n)) + 0.99).toFixed(2);
 
 function seoFrom(title, description){
-  const cleanTitle = clamp(title.replace(/\s+\|\s+.*/,""), 60);
+  const cleanTitle = clamp((title||"").replace(/\s+\|\s+.*/,""), 60);
   const metaDesc = clamp(description || "Luxury jewelry by DTP Jewelry.", 160);
   return { title: cleanTitle, description: metaDesc };
 }
@@ -29,10 +25,7 @@ function seoFrom(title, description){
 async function gql(query, variables={}){
   const res = await fetch(API, {
     method:"POST",
-    headers:{
-      "Content-Type":"application/json",
-      "X-Shopify-Access-Token": TOKEN
-    },
+    headers:{ "Content-Type":"application/json", "X-Shopify-Access-Token": TOKEN },
     body: JSON.stringify({ query, variables })
   });
   const j = await res.json();
@@ -40,7 +33,7 @@ async function gql(query, variables={}){
   return j.data;
 }
 
-// --- Competitor price lookup (SerpAPI) ---
+// competitor pricing (optional)
 async function fetchCompetitorPrices(query){
   if (!SERPAPI_KEY) return [];
   const url = `https://serpapi.com/search.json?engine=google_shopping&q=${encodeURIComponent(query)}&hl=en&gl=uk&api_key=${SERPAPI_KEY}`;
@@ -53,46 +46,54 @@ async function fetchCompetitorPrices(query){
   }
   return out.filter(x=>x>2 && x<2000);
 }
-
 function pickPrice(competitors){
   if (!competitors.length) return 29.99;
-  const sorted = competitors.sort((a,b)=>a-b);
-  const med = sorted[Math.floor(sorted.length/2)];
-  return round99(med * 1.1); // median +10% premium
+  const s = [...competitors].sort((a,b)=>a-b);
+  const med = s[Math.floor(s.length/2)];
+  return parseFloat(round99(med * 1.1)); // median +10%, .99
 }
 
-// --- Webhook endpoint for new products ---
+// mutations
+const M_PRODUCT_UPDATE = `
+mutation($input:ProductInput!){
+  productUpdate(input:$input){
+    product{ id title }
+    userErrors{ field message }
+  }
+}`;
+const M_VARIANT_UPDATE = `
+mutation($input:ProductVariantInput!){
+  productVariantUpdate(input:$input){
+    productVariant{ id price }
+    userErrors{ field message }
+  }
+}`;
+
 app.post("/webhook/products/create", async (req,res)=>{
   try{
-    const product = req.body;
-    console.log("➡️ New product created:", product.title);
+    const p = req.body;
+    console.log("➡️ New product created:", p.title);
 
-    const { title, body_html } = product;
-    const desc = body_html.replace(/<[^>]+>/g,"");
+    // descriptions can be empty or HTML; strip tags safely
+    const rawDesc = (p.body_html || "").toString();
+    const desc = clamp(rawDesc.replace(/<[^>]+>/g," "), 1000);
 
-    // competitor lookup
-    const competitors = await fetchCompetitorPrices(title);
-    const price = pickPrice(competitors);
+    // competitor lookup -> price
+    const competitors = await fetchCompetitorPrices(p.title || "");
+    const newPrice = pickPrice(competitors);
 
-    // SEO
-    const seo = seoFrom(title, desc);
+    // 1) update SEO on the product
+    const seo = seoFrom(p.title || "", desc);
+    await gql(M_PRODUCT_UPDATE, { input: { id: p.admin_graphql_api_id, seo } });
 
-    // Update product in Shopify
-    const mutation = `
-      mutation($input:ProductInput!){
-        productUpdate(input:$input){
-          product{ id title }
-          userErrors{ field message }
-        }
-      }`;
-    const input = {
-      id: product.admin_graphql_api_id,
-      seo,
-      variants: [{ id: product.variants[0].admin_graphql_api_id, price }]
-    };
-    await gql(mutation, { input });
+    // 2) update price on each variant
+    const variants = Array.isArray(p.variants) ? p.variants : [];
+    for (const v of variants){
+      if (!v?.admin_graphql_api_id) continue;
+      await gql(M_VARIANT_UPDATE, { input: { id: v.admin_graphql_api_id, price: newPrice } });
+    }
 
-    console.log(`✅ Updated ${title} with SEO + price £${price}`);
+    console.log(`✅ Updated "${p.title}" with SEO + price £${newPrice}`);
     res.sendStatus(200);
   }catch(e){
     console.error("❌ Webhook error:", e);
@@ -100,6 +101,5 @@ app.post("/webhook/products/create", async (req,res)=>{
   }
 });
 
-// --- Start server ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=>console.log(`🚀 Webhook server running on port ${PORT}`));
+app.listen(PORT, ()=>console.log(`🚀 Webhook server running on ${PORT}`));
