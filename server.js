@@ -1,26 +1,26 @@
-// server.js — DTP Auto Enrichment (unique SEO + pricing + tags/collections/alt)
-// Node 18+
-// ENV required: SHOPIFY_SHOP, SHOPIFY_TOKEN
-// Optional: SERPAPI_KEY (SerpAPI key for competitor pricing), USD_GBP
+// server.js — DTP Auto Enrichment
+// Unique SEO + pricing + tags + collections + image ALT
+// Variant pricing: REST first, fallback to GraphQL if REST 404s
+// Env: SHOPIFY_SHOP, SHOPIFY_TOKEN, (optional) SERPAPI_KEY, USD_GBP
 
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
-const SHOP = process.env.SHOPIFY_SHOP;         // e.g. dtpjewellry.myshopify.com
-const TOKEN = process.env.SHOPIFY_TOKEN;       // Admin API token (shpat_…)
+const SHOP = process.env.SHOPIFY_SHOP;          // e.g. dtpjewellry.myshopify.com
+const TOKEN = process.env.SHOPIFY_TOKEN;        // shpat_...
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
 
 if (!SHOP || !TOKEN) {
-  console.error("❌ Missing SHOPIFY_SHOP or SHOPIFY_TOKEN. Set env vars and redeploy.");
+  console.error("❌ Missing SHOPIFY_SHOP or SHOPIFY_TOKEN.");
   process.exit(1);
 }
 
 const app = express();
 app.use(bodyParser.json({ type: "*/*" }));
 
-// ───────────────────────── helpers ─────────────────────────
+// ───────────────── helpers ─────────────────
 const clamp = (s, n) => (s || "").toString().trim().replace(/\s+/g, " ").slice(0, n);
 const round99 = (n) => (Math.max(0, Math.round(n)) + 0.99).toFixed(2);
 const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
@@ -75,7 +75,7 @@ function fallbackPrice(material) {
   return 21.99; // alloy+stone
 }
 
-// ── UNIQUE SEO generator
+// Unique SEO generator
 function seoFrom(title, description, material, tags = []) {
   const cleanTitle = (title || "").replace(/\s+\|\s+.*/, "").trim();
 
@@ -102,7 +102,7 @@ function seoFrom(title, description, material, tags = []) {
   return { title: seoTitle, description: seoDescription };
 }
 
-// ────────────────────── competitor pricing (optional) ──────────────────────
+// ───────────── competitor pricing (optional) ─────────────
 async function fetchCompetitorPrices(query) {
   if (!SERPAPI_KEY) return [];
   const r = await fetch(
@@ -110,7 +110,7 @@ async function fetchCompetitorPrices(query) {
   );
   const j = await r.json();
   const out = [];
-  for (const it of j.shopping_results || []) {
+  for (const it of (j.shopping_results || [])) {
     const p = it.extracted_price;
     if (p) out.push(p);
   }
@@ -120,10 +120,10 @@ function pickPriceFromCompetitors(prices) {
   if (!prices.length) return null;
   const s = [...prices].sort((a, b) => a - b);
   const med = s[Math.floor(s.length / 2)];
-  return parseFloat(round99(med * 1.1)); // median +10% premium
+  return parseFloat(round99(med * 1.1)); // median +10%
 }
 
-// ───────────────────── REST + GraphQL helpers ─────────────────────
+// ───────────── REST + GraphQL helpers ─────────────
 async function rest(path, method = "GET", body = null) {
   const url = `https://${SHOP}/admin/api/2024-07/${path}`;
   const res = await fetch(url, {
@@ -138,7 +138,7 @@ async function rest(path, method = "GET", body = null) {
   return res.json();
 }
 
-// SEO must use GraphQL (REST has no SEO fields)
+// SEO via GraphQL (REST lacks SEO fields)
 async function updateProductSEO(productGid, title, description) {
   const API = `https://${SHOP}/admin/api/2024-07/graphql.json`;
   const mutation = `
@@ -154,17 +154,44 @@ async function updateProductSEO(productGid, title, description) {
     body: JSON.stringify({ query: mutation, variables: { input: { id: productGid, seo: { title, description } } } })
   });
   const j = await r.json();
-  if (j.errors || j.data?.productUpdate?.userErrors?.length) {
-    console.error("❌ SEO update failed:", JSON.stringify(j));
-  } else {
-    console.log("   ✔ SEO updated:", title, "|", description);
-  }
+  const errs = j.errors || j.data?.productUpdate?.userErrors || [];
+  if (errs.length) console.error("❌ SEO update failed:", JSON.stringify(errs));
+  else console.log("   ✔ SEO updated:", title, "|", description);
 }
 
-async function updateVariantPriceREST(variantGid, price) {
-  const id = Number(toNumericId(variantGid));
-  await rest(`variants/${id}.json`, "PUT", { variant: { id, price: String(price) } });
-  console.log(`   ✔ Variant ${id} -> £${price}`);
+// Variant pricing: REST first, GraphQL fallback if REST 404s
+async function updateVariantPrice(variantGid, price) {
+  const idNum = Number(toNumericId(variantGid));
+
+  // 1) Try REST
+  try {
+    await rest(`variants/${idNum}.json`, "PUT", { variant: { id: idNum, price: String(price) } });
+    console.log(`   ✔ Variant ${idNum} (REST) -> £${price}`);
+    return;
+  } catch (e) {
+    const msg = String(e.message || e);
+    if (!/404/.test(msg)) throw e; // different error
+    console.warn(`   • REST 404 for variant ${idNum}, trying GraphQL…`);
+  }
+
+  // 2) Fallback GraphQL
+  const API = `https://${SHOP}/admin/api/2024-07/graphql.json`;
+  const mutation = `
+    mutation($input: ProductVariantInput!) {
+      productVariantUpdate(input: $input) {
+        productVariant { id price }
+        userErrors { field message }
+      }
+    }`;
+  const r = await fetch(API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN },
+    body: JSON.stringify({ query: mutation, variables: { input: { id: variantGid, price: parseFloat(price) } } })
+  });
+  const j = await r.json();
+  const errs = j.errors || j.data?.productVariantUpdate?.userErrors || [];
+  if (errs.length) throw new Error("GraphQL variant update failed: " + JSON.stringify(errs));
+  console.log(`   ✔ Variant ${idNum} (GraphQL) -> £${price}`);
 }
 
 async function setAltTextIfMissing(productGid, altBase) {
@@ -204,7 +231,7 @@ async function setMaterialMetafield(productGid, material) {
   console.log(`   ✔ Metafield (dtp.material) = ${material}`);
 }
 
-// ───────────────────────── webhook ─────────────────────────
+// ───────────── webhook ─────────────
 app.post("/webhook/products/create", async (req, res) => {
   try {
     const p = req.body;
@@ -219,7 +246,6 @@ app.post("/webhook/products/create", async (req, res) => {
     const tags = uniq([...(p.tags || "").split(",").map(t => t.trim()).filter(Boolean), ...inferTags(combinedText)]);
     console.log("   • material:", material, "| tags:", tags.join(", "));
 
-    // Competitor pricing (optional)
     let benchPrice = null;
     if (SERPAPI_KEY) {
       const prices = await fetchCompetitorPrices(title);
@@ -236,7 +262,7 @@ app.post("/webhook/products/create", async (req, res) => {
     await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, tags: tags.join(", ") } });
     console.log(`   ✔ Tags set (${tags.length})`);
 
-    // Variant pricing via REST
+    // Variant pricing
     const variants = Array.isArray(p.variants) ? p.variants : [];
     const isMoissanite = material === "s925+moissanite";
     for (const v of variants) {
@@ -246,7 +272,7 @@ app.post("/webhook/products/create", async (req, res) => {
       if (isMoissanite && mm)      price = ladderPriceForMoissanite(mm);
       else if (benchPrice)         price = benchPrice;
       else                         price = fallbackPrice(material);
-      await updateVariantPriceREST(v.admin_graphql_api_id, price);
+      await updateVariantPrice(v.admin_graphql_api_id, price);
     }
 
     // Metafield + collections + ALT text
@@ -268,8 +294,3 @@ app.get("/", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Webhook server running on ${PORT}`));
-
-
-
-
-
