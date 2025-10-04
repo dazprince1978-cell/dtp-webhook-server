@@ -1,6 +1,6 @@
 {
   "name": "dtp-webhook-server",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
