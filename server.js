@@ -1,6 +1,8 @@
-// server.js — DTP Auto Enrichment v3
-// Unique SEO + full on-page description + pricing + tags + collections + image ALT
-// Variant pricing: REST first, GraphQL fallback
+// server.js — DTP Auto Enrichment v4
+// Unique SEO + full rewritten description + robust tagging + pricing + collections + ALT
+// - Always rewrites description (and strips <img>/<figure> from any old HTML)
+// - Tags extended (style + motif + region keywords)
+// - Pricing: REST first, GraphQL fallback; competitor query improved + sane caps
 // Env: SHOPIFY_SHOP, SHOPIFY_TOKEN, (optional) SERPAPI_KEY, USD_GBP
 
 import express from "express";
@@ -10,7 +12,7 @@ import fetch from "node-fetch";
 const SHOP = process.env.SHOPIFY_SHOP;          // e.g. dtpjewellry.myshopify.com
 const TOKEN = process.env.SHOPIFY_TOKEN;        // shpat_...
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
-const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
+const USD_GBP = parseFloat(process.env.USD_GBP || "0.78"); // optional fallback if needed
 
 if (!SHOP || !TOKEN) {
   console.error("❌ Missing SHOPIFY_SHOP or SHOPIFY_TOKEN.");
@@ -22,21 +24,22 @@ app.use(bodyParser.json({ type: "*/*" }));
 
 // ───────── helpers ─────────
 const clamp = (s, n) => (s || "").toString().trim().replace(/\s+/g, " ").slice(0, n);
-const round99 = (n) => (Math.max(0, Math.round(n)) + 0.99).toFixed(2);
 const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 const toNumericId = (gid) => (gid ? String(gid).split("/").pop() : null);
 
-// lightweight keyword sets
-const JEWELRY_WORDS = /(necklace|pendant|chain|bracelet|earrings?|ring|anklet|choker|tennis)/i;
 const ELECTRONICS_WORDS = /(iphone|samsung|pixel|galaxy|airpods|ps5|xbox|laptop|camera|tablet|phone)/i;
-const STONE_WORDS =
-  /(moissanite|amethyst|opal|agate|carnelian|rose quartz|quartz|tiger'?s eye|onyx|malachite|turquoise|zircon|cubic zirconia|cz|crystal)/i;
+const STONE_WORDS = /(moissanite|amethyst|opal|agate|carnelian|rose quartz|quartz|tiger'?s eye|onyx|malachite|turquoise|zircon|cubic zirconia|cz|crystal|garnet|ruby|sapphire|emerald)/i;
+
+function stripImages(html = "") {
+  return (html || "")
+    .replace(/<figure[\s\S]*?<\/figure>/gi, "")
+    .replace(/<img[\s\S]*?>/gi, "");
+}
 
 function inferStone(text) {
   const m = (text || "").toLowerCase().match(STONE_WORDS);
   if (!m) return null;
   const s = m[0];
-  // normalize
   if (s === "cz" || s === "cubic zirconia") return "Cubic Zirconia";
   if (/tiger/.test(s)) return "Tiger’s Eye";
   if (/rose quartz/.test(s)) return "Rose Quartz";
@@ -48,22 +51,20 @@ function inferMaterial(text) {
   if (/\bmoissanite\b/.test(s) && (/\bs925\b/.test(s) || /sterling/.test(s))) return "s925+moissanite";
   if (/\bs925\b/.test(s) || /sterling silver/.test(s)) return "s925+plain";
   if (/stainless/.test(s)) return "steel+plain";
-  if (/alloy|zinc alloy|copper alloy|plated|crystal|quartz|agate|amethyst|opal|stone|carnelian|tiger'?s eye|onyx|turquoise/.test(s))
-    return "alloy+stone";
   return "alloy+stone";
 }
 
 function inferType({ title, product_type, tagsText }) {
-  const s = `${title || ""} ${product_type || ""} ${tagsText || ""}`;
-  if (/bracelet/i.test(s)) return "Bracelet";
-  if (/earrings?/i.test(s)) return "Earrings";
-  if (/rings?/i.test(s)) return "Ring";
-  if (/anklet/i.test(s)) return "Anklet";
-  if (/choker/i.test(s)) return "Choker";
-  if (/pendant/i.test(s)) return "Pendant Necklace";
-  if (/chain/i.test(s)) return "Chain Necklace";
-  if (/tennis/i.test(s)) return "Tennis Necklace";
-  if (/necklace/i.test(s)) return "Necklace";
+  const s = `${title || ""} ${product_type || ""} ${(tagsText || "").toLowerCase()}`;
+  if (s.includes("bracelet")) return "Bracelet";
+  if (s.includes("earring")) return "Earrings";
+  if (s.includes("ring")) return "Ring";
+  if (s.includes("anklet")) return "Anklet";
+  if (s.includes("choker")) return "Choker";
+  if (s.includes("tennis")) return "Tennis Necklace";
+  if (s.includes("pendant")) return "Pendant Necklace";
+  if (s.includes("chain")) return "Chain Necklace";
+  if (s.includes("necklace")) return "Necklace";
   return "Jewelry";
 }
 
@@ -90,19 +91,37 @@ function fallbackPrice(material) {
   return 21.99; // alloy+stone
 }
 
-function inferTags(text) {
+// enriched tags: category + style + motif + region
+function inferTagsRich(text) {
   const s = (text || "").toLowerCase();
-  const tags = new Set(["Jewelry"]);
-  if (/necklace/.test(s)) tags.add("necklaces");
-  if (/bracelet/.test(s)) tags.add("bracelets");
-  if (/earrings?/.test(s)) tags.add("earrings");
-  if (/ring/.test(s)) tags.add("rings");
-  if (/tennis/.test(s)) { tags.add("tennis"); tags.add("minimal"); }
-  if (/tree of life/.test(s)) { tags.add("tree-of-life"); tags.add("spiritual"); }
-  if (/moissanite/.test(s)) tags.add("moissanite");
-  if (/\bs925\b|sterling/.test(s)) { tags.add("s925"); tags.add("sterling-silver"); }
-  if (/stainless/.test(s)) tags.add("stainless-steel");
-  if (STONE_WORDS.test(s)) { tags.add("crystal"); tags.add("stone"); tags.add("gift"); }
+  const tags = new Set();
+
+  // base
+  if (s.includes("necklace")) tags.add("necklaces");
+  if (s.includes("bracelet")) tags.add("bracelets");
+  if (s.includes("earring")) tags.add("earrings");
+  if (s.includes("ring")) tags.add("rings");
+  if (s.includes("pendant")) tags.add("pendant");
+  if (s.includes("chain")) tags.add("chain");
+
+  // stones/material
+  if (STONE_WORDS.test(s)) { tags.add("crystal"); tags.add("stone"); }
+  if (s.includes("moissanite")) tags.add("moissanite");
+  if (s.includes("s925") || s.includes("sterling")) { tags.add("s925"); tags.add("sterling-silver"); }
+  if (s.includes("stainless")) tags.add("stainless-steel");
+
+  // style/region/motif
+  if (s.includes("retro") || s.includes("vintage")) { tags.add("retro"); tags.add("vintage"); }
+  if (s.includes("european")) tags.add("european");
+  if (s.includes("italian")) tags.add("italian");
+  if (s.includes("palace")) tags.add("palace");
+  if (s.includes("medallion") || s.includes("medal")) tags.add("medallion");
+  if (s.includes("flower") || s.includes("floral")) tags.add("floral");
+  if (s.includes("sun") || s.includes("sunburst")) tags.add("sunburst");
+  if (s.includes("men")) tags.add("mens");
+  if (s.includes("women")) tags.add("womens");
+  tags.add("gift");
+
   return Array.from(tags);
 }
 
@@ -117,26 +136,24 @@ function seoFrom({ title, description, material, type, stone }) {
                                      "Crystal & Alloy";
 
   const stoneBit = stone ? `${stone} ` : "";
-
   let hook = "Hypoallergenic, durable and gift-ready.";
   if (stone && /moissanite/i.test(stone)) hook = "Brilliant sparkle that rivals diamonds.";
-  else if (/spiritual/i.test(description || "")) hook = "Symbolic design for balance and energy.";
-  else if (/tennis/i.test(title || "")) hook = "Sleek, modern line with everyday shine.";
+  else if (/retro|vintage|palace/.test((title || "").toLowerCase())) hook = "Vintage-inspired detailing with modern durability.";
 
   const seoTitle = clamp(`${cleanTitle} | ${stoneBit}${materialLabel} by DTP Jewelry`, 60);
   const seoDescription = clamp(`${cleanTitle} — ${type} crafted in ${stoneBit}${materialLabel}. ${hook}`, 160);
   return { title: seoTitle, description: seoDescription };
 }
 
-// Generate a unique on-page description (HTML)
+// Unique on-page description (HTML)
 function buildProductHTML({ title, type, material, stone, lengthOptionsMM = [] }) {
   const materialLabel =
     material === "s925+moissanite" ? "S925 sterling silver with moissanite" :
     material === "s925+plain"      ? "solid S925 sterling silver" :
     material === "steel+plain"     ? "stainless steel" :
-                                     "durable alloy with polished finish";
+                                     "durable jewelry alloy with polished finish";
 
-  const stoneLine = stone ? `${stone} stone` : `high-polish finish`;
+  const stoneLine = stone ? `${stone} accents` : `a high-polish finish`;
 
   const sizes =
     lengthOptionsMM.length
@@ -148,13 +165,13 @@ function buildProductHTML({ title, type, material, stone, lengthOptionsMM = [] }
 
   const whyBullets = [
     stone && /moissanite/i.test(stone) ? "Diamond-like brilliance with excellent fire" : null,
-    material === "s925+plain" ? "Hypoallergenic and safe for sensitive skin" : null,
-    /necklace|pendant|chain/i.test(type) ? "Versatile design for everyday and occasion wear" : "Polished finish with comfortable wear",
-    "Gift-ready presentation"
+    material === "s925+plain" ? "Hypoallergenic and comfortable for daily wear" : "Comfortable everyday wear",
+    /necklace|pendant|chain/i.test(type) ? "Versatile piece to layer or wear solo" : "Refined profile for any outfit",
+    "Arrives gift-ready"
   ].filter(Boolean);
 
   return `
-<p><strong>${title}</strong> — a ${type.toLowerCase()} crafted from ${materialLabel} with ${stoneLine}. A refined piece that elevates everyday style and shines for special occasions.</p>
+<p><strong>${title}</strong> — a ${type.toLowerCase()} crafted from ${materialLabel} with ${stoneLine}. Classic design, refined detailing and durable construction make it an easy upgrade to your everyday style.</p>
 
 <p><strong>Why you’ll love it</strong></p>
 <ul>
@@ -166,33 +183,39 @@ function buildProductHTML({ title, type, material, stone, lengthOptionsMM = [] }
   <li>Material: ${materialLabel}</li>
   ${stone ? `<li>Stone: ${stone}</li>` : ""}
   ${sizes ? `<li>${sizes}</li>` : ""}
-  <li>Closure & fit: designed for secure, comfortable wear</li>
+  <li>Closure & fit: secure, comfortable wear</li>
 </ul>
 
 <p><strong>Care</strong></p>
-<p>Wipe with a soft dry cloth after wear. Store separately to protect the finish and setting.</p>
+<p>Wipe with a soft dry cloth after wear and store separately to protect the finish and setting.</p>
 `;
 }
 
 // ───────── competitor pricing (optional) ─────────
-async function fetchCompetitorPrices(query) {
+async function fetchCompetitorPrices({ title, type, material, stone }) {
   if (!SERPAPI_KEY) return [];
-  const r = await fetch(
-    `https://serpapi.com/search.json?engine=google_shopping&q=${encodeURIComponent(query)}&hl=en&gl=uk&api_key=${SERPAPI_KEY}`
-  );
+  const qParts = [title, type, stone || "", material.includes("s925") ? "S925 sterling silver" : ""]
+    .filter(Boolean)
+    .join(" ");
+  const url = `https://serpapi.com/search.json?engine=google_shopping&q=${encodeURIComponent(qParts)}&hl=en&gl=uk&api_key=${SERPAPI_KEY}`;
+  const r = await fetch(url);
   const j = await r.json();
   const out = [];
   for (const it of (j.shopping_results || [])) {
     const p = it.extracted_price;
     if (p) out.push(p);
   }
-  return out.filter((x) => x > 2 && x < 2000);
+  return out.filter((x) => x > 4 && x < 800); // keep sane range for jewelry
 }
 function pickPriceFromCompetitors(prices) {
   if (!prices.length) return null;
   const s = [...prices].sort((a, b) => a - b);
   const med = s[Math.floor(s.length / 2)];
-  return parseFloat(round99(med * 1.1));
+  // clamp to a sane retail window for your store
+  const clamped = Math.min(Math.max(med * 1.1, 9.99), 399.99);
+  // pretty endings
+  const pretty = Math.round(clamped) + 0.99;
+  return Number(pretty.toFixed(2));
 }
 
 // ───────── REST + GraphQL helpers ─────────
@@ -234,9 +257,15 @@ async function updateProductSEO(productGid, title, description) {
 // Variant pricing: REST first, GraphQL fallback
 async function updateVariantPrice(variantGid, price) {
   const idNum = Number(toNumericId(variantGid));
+  // sanitise price
+  let p = Number(price);
+  if (!isFinite(p) || p <= 0) p = 9.99;
+  p = Math.min(Math.max(p, 6.99), 499.99);
+  p = Math.round(p) + 0.99;
+
   try {
-    await rest(`variants/${idNum}.json`, "PUT", { variant: { id: idNum, price: String(price) } });
-    console.log(`   ✔ Variant ${idNum} (REST) -> £${price}`);
+    await rest(`variants/${idNum}.json`, "PUT", { variant: { id: idNum, price: String(p) } });
+    console.log(`   ✔ Variant ${idNum} (REST) -> £${p.toFixed(2)}`);
     return;
   } catch (e) {
     const msg = String(e.message || e);
@@ -255,12 +284,12 @@ async function updateVariantPrice(variantGid, price) {
   const r = await fetch(API, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN },
-    body: JSON.stringify({ query: mutation, variables: { input: { id: variantGid, price: parseFloat(price) } } })
+    body: JSON.stringify({ query: mutation, variables: { input: { id: variantGid, price: p } } })
   });
   const j = await r.json();
   const errs = j.errors || j.data?.productVariantUpdate?.userErrors || [];
   if (errs.length) throw new Error("GraphQL variant update failed: " + JSON.stringify(errs));
-  console.log(`   ✔ Variant ${idNum} (GraphQL) -> £${price}`);
+  console.log(`   ✔ Variant ${idNum} (GraphQL) -> £${p.toFixed(2)}`);
 }
 
 async function setAltTextIfMissing(productGid, altBase) {
@@ -306,13 +335,13 @@ app.post("/webhook/products/create", async (req, res) => {
     const p = req.body;
     console.log("➡️  New product:", p.title);
 
-    // If clearly not jewelry, bail to avoid junk content
     if (ELECTRONICS_WORDS.test(p.title || "")) {
-      console.warn("   • Skipping enrichment (non-jewelry title detected).");
+      console.warn("   • Skipping enrichment (looks like electronics).");
       return res.sendStatus(200);
     }
 
-    const rawDesc = (p.body_html || "").toString();
+    const originalHTML = (p.body_html || "").toString();
+    const rawDesc = stripImages(originalHTML); // drop any embedded images
     const desc = clamp(rawDesc.replace(/<[^>]+>/g, " "), 1200);
     const title = p.title || "";
     const combined = `${title} ${p.product_type || ""} ${(p.tags || "")} ${desc}`;
@@ -321,13 +350,15 @@ app.post("/webhook/products/create", async (req, res) => {
     const material = inferMaterial(combined);
     const stone = inferStone(combined);
     const type = inferType({ title, product_type: p.product_type, tagsText: p.tags });
-    const tags = uniq([...(p.tags || "").split(",").map(t => t.trim()).filter(Boolean), ...inferTags(combined)]);
+    const inferredTags = inferTagsRich(combined);
+    const currentTags = (p.tags || "").split(",").map(t => t.trim()).filter(Boolean);
+    const tags = uniq([...currentTags, ...inferredTags]);
     console.log("   • material:", material, "| stone:", stone || "-", "| type:", type, "| tags:", tags.join(", "));
 
     // Competitor pricing (optional)
     let benchPrice = null;
-    if (SERPAPI_KEY && JEWELRY_WORDS.test(combined)) {
-      const prices = await fetchCompetitorPrices(title);
+    if (SERPAPI_KEY) {
+      const prices = await fetchCompetitorPrices({ title, type, material, stone });
       benchPrice = pickPriceFromCompetitors(prices);
       if (benchPrice) console.log("   • competitor picked:", benchPrice);
     }
@@ -336,37 +367,31 @@ app.post("/webhook/products/create", async (req, res) => {
     const { title: seoTitle, description: seoDesc } = seoFrom({ title, description: desc, material, type, stone });
     await updateProductSEO(p.admin_graphql_api_id, seoTitle, seoDesc);
 
-    // Generate & write on-page description HTML (if empty or very short)
+    // Build & write on-page description (always overwrite for clean result)
     const productIdNum = Number(toNumericId(p.admin_graphql_api_id));
-    if (!rawDesc || rawDesc.replace(/<[^>]+>/g, "").trim().length < 40) {
-      // derive length options from variants for details block
-      const variants = Array.isArray(p.variants) ? p.variants : [];
-      const mmOptions = uniq(
-        variants
-          .map(v => parseLengthMM(v.title) || parseLengthMM(v.option1) || parseLengthMM(v.option2) || parseLengthMM(v.option3))
-          .filter(Boolean)
-      );
-      const html = buildProductHTML({ title, type, material, stone, lengthOptionsMM: mmOptions });
-      await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, body_html: html } });
-      console.log("   ✔ On-page description written");
-    } else {
-      console.log("   • Kept existing description (non-empty)");
-    }
+    const variantsIncoming = Array.isArray(p.variants) ? p.variants : [];
+    const mmOptions = uniq(
+      variantsIncoming
+        .map(v => parseLengthMM(v.title) || parseLengthMM(v.option1) || parseLengthMM(v.option2) || parseLengthMM(v.option3))
+        .filter(Boolean)
+    );
+    const html = buildProductHTML({ title, type, material, stone, lengthOptionsMM: mmOptions });
+    await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, body_html: html } });
+    console.log("   ✔ On-page description written (images removed)");
 
     // Tags via REST
     await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, tags: tags.join(", ") } });
     console.log(`   ✔ Tags set (${tags.length})`);
 
     // Variant pricing
-    const variants = Array.isArray(p.variants) ? p.variants : [];
     const isMoissanite = material === "s925+moissanite";
-    for (const v of variants) {
+    for (const v of variantsIncoming) {
       if (!v?.admin_graphql_api_id) continue;
       const mm = parseLengthMM(v.title) || parseLengthMM(v.option1) || parseLengthMM(v.option2) || parseLengthMM(v.option3);
       let price;
-      if (isMoissanite && mm)      price = ladderPriceForMoissanite(mm);
-      else if (benchPrice)         price = benchPrice;
-      else                         price = fallbackPrice(material);
+      if (isMoissanite && mm) price = ladderPriceForMoissanite(mm);
+      else if (benchPrice) price = benchPrice;
+      else price = fallbackPrice(material);
       await updateVariantPrice(v.admin_graphql_api_id, price);
     }
 
