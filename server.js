@@ -1,31 +1,30 @@
+// server.js — DTP Auto Enrichment (unique SEO + pricing + tags/collections/alt)
+// Node 18+
+// ENV required: SHOPIFY_SHOP, SHOPIFY_TOKEN
+// Optional: SERPAPI_KEY (SerpAPI key for competitor pricing), USD_GBP
+
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
-const SHOP = process.env.SHOPIFY_SHOP;
-const TOKEN = process.env.SHOPIFY_TOKEN;
+const SHOP = process.env.SHOPIFY_SHOP;         // e.g. dtpjewellry.myshopify.com
+const TOKEN = process.env.SHOPIFY_TOKEN;       // Admin API token (shpat_…)
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
 
 if (!SHOP || !TOKEN) {
-  console.error("❌ Missing SHOPIFY_SHOP or SHOPIFY_TOKEN env vars.");
+  console.error("❌ Missing SHOPIFY_SHOP or SHOPIFY_TOKEN. Set env vars and redeploy.");
   process.exit(1);
 }
 
 const app = express();
 app.use(bodyParser.json({ type: "*/*" }));
 
-// ---------- helpers ----------
+// ───────────────────────── helpers ─────────────────────────
 const clamp = (s, n) => (s || "").toString().trim().replace(/\s+/g, " ").slice(0, n);
 const round99 = (n) => (Math.max(0, Math.round(n)) + 0.99).toFixed(2);
 const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 const toNumericId = (gid) => (gid ? String(gid).split("/").pop() : null);
-
-function seoFrom(title, description) {
-  const cleanTitle = clamp(title || "Luxury Jewelry by DTP Jewelry", 60);
-  const metaDesc = clamp(description || "Luxury jewelry handcrafted by DTP Jewelry.", 160);
-  return { title: cleanTitle, description: metaDesc };
-}
 
 function inferMaterial(text) {
   const s = (text || "").toLowerCase();
@@ -33,6 +32,7 @@ function inferMaterial(text) {
   if (/\bs925\b/.test(s) || /sterling silver/.test(s)) return "s925+plain";
   if (/stainless/.test(s)) return "steel+plain";
   if (/crystal|quartz|agate|stone|amethyst|opal|carnelian|tiger'?s eye/.test(s)) return "alloy+stone";
+  if (/alloy|zinc alloy|copper alloy|plated/.test(s)) return "alloy+stone";
   return "alloy+stone";
 }
 
@@ -47,24 +47,62 @@ function inferTags(text) {
   if (/tree of life/.test(s)) { tags.add("tree-of-life"); tags.add("spiritual"); }
   if (/moissanite/.test(s)) tags.add("moissanite");
   if (/\bs925\b|sterling/.test(s)) { tags.add("s925"); tags.add("sterling-silver"); }
+  if (/stainless/.test(s)) tags.add("stainless-steel");
+  if (/crystal|stone|quartz|agate|opal|amethyst|carnelian|tiger'?s eye/.test(s)) { tags.add("crystal"); tags.add("stone"); tags.add("gift"); }
   return Array.from(tags);
+}
+
+function parseLengthMM(str) {
+  if (!str) return null;
+  const s = String(str).toLowerCase();
+  const mm = s.match(/\b(4[0-9]{2}|5[0-9]{2})\s*mm\b/); if (mm) return parseInt(mm[1], 10);
+  const cm = s.match(/\b(4[0-9]|5[0-9])\s*cm\b/);       if (cm) return parseInt(cm[1], 10) * 10;
+  const inch = s.match(/\b(1[6-9]|2[0-2])\s*("|inch|in)\b/); if (inch) return Math.round(parseFloat(inch[1]) * 25.4);
+  return null;
 }
 
 function ladderPriceForMoissanite(mm) {
   if (!mm) return 329.99;
-  if (mm <= 460) return 329.99;
-  if (mm <= 510) return 349.99;
-  return 369.99;
+  if (mm <= 460) return 329.99;   // ~18"
+  if (mm <= 510) return 349.99;   // ~20"
+  return 369.99;                  // ~22"
 }
 
 function fallbackPrice(material) {
   if (material === "s925+moissanite") return 329.99;
   if (material === "s925+plain") return 24.99;
   if (material === "steel+plain") return 14.99;
-  return 21.99;
+  return 21.99; // alloy+stone
 }
 
-// ---------- competitor pricing ----------
+// ── UNIQUE SEO generator
+function seoFrom(title, description, material, tags = []) {
+  const cleanTitle = (title || "").replace(/\s+\|\s+.*/, "").trim();
+
+  const materialLabel =
+    material === "s925+moissanite" ? "Moissanite in S925 Sterling Silver" :
+    material === "s925+plain"      ? "S925 Sterling Silver" :
+    material === "steel+plain"     ? "Stainless Steel" :
+                                     "Crystal & Alloy";
+
+  const type =
+    (tags.includes("necklaces") && "Necklace") ||
+    (tags.includes("bracelets") && "Bracelet") ||
+    (tags.includes("earrings")  && "Earrings") ||
+    (tags.includes("rings")     && "Ring") ||
+    "Jewelry";
+
+  let hook = "Hypoallergenic, durable and gift-ready.";
+  if (tags.includes("moissanite")) hook = "Brilliant sparkle that rivals diamonds.";
+  else if (tags.includes("spiritual")) hook = "Symbolic design for balance and energy.";
+  else if (tags.includes("tennis")) hook = "Sleek, modern line with everyday shine.";
+
+  const seoTitle = clamp(`${cleanTitle} | ${materialLabel} by DTP Jewelry`, 60);
+  const seoDescription = clamp(`${cleanTitle} — ${type} crafted in ${materialLabel}. ${hook}`, 160);
+  return { title: seoTitle, description: seoDescription };
+}
+
+// ────────────────────── competitor pricing (optional) ──────────────────────
 async function fetchCompetitorPrices(query) {
   if (!SERPAPI_KEY) return [];
   const r = await fetch(
@@ -82,18 +120,15 @@ function pickPriceFromCompetitors(prices) {
   if (!prices.length) return null;
   const s = [...prices].sort((a, b) => a - b);
   const med = s[Math.floor(s.length / 2)];
-  return parseFloat(round99(med * 1.1));
+  return parseFloat(round99(med * 1.1)); // median +10% premium
 }
 
-// ---------- REST + GraphQL helpers ----------
+// ───────────────────── REST + GraphQL helpers ─────────────────────
 async function rest(path, method = "GET", body = null) {
   const url = `https://${SHOP}/admin/api/2024-07/${path}`;
   const res = await fetch(url, {
     method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": TOKEN
-    },
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN },
     body: body ? JSON.stringify(body) : null
   });
   if (!res.ok) {
@@ -103,6 +138,7 @@ async function rest(path, method = "GET", body = null) {
   return res.json();
 }
 
+// SEO must use GraphQL (REST has no SEO fields)
 async function updateProductSEO(productGid, title, description) {
   const API = `https://${SHOP}/admin/api/2024-07/graphql.json`;
   const mutation = `
@@ -121,7 +157,7 @@ async function updateProductSEO(productGid, title, description) {
   if (j.errors || j.data?.productUpdate?.userErrors?.length) {
     console.error("❌ SEO update failed:", JSON.stringify(j));
   } else {
-    console.log("   ✔ SEO updated:", title);
+    console.log("   ✔ SEO updated:", title, "|", description);
   }
 }
 
@@ -168,11 +204,11 @@ async function setMaterialMetafield(productGid, material) {
   console.log(`   ✔ Metafield (dtp.material) = ${material}`);
 }
 
-// ---------- webhook ----------
+// ───────────────────────── webhook ─────────────────────────
 app.post("/webhook/products/create", async (req, res) => {
   try {
     const p = req.body;
-    console.log("➡️ New product:", p.title);
+    console.log("➡️  New product:", p.title);
 
     const rawDesc = (p.body_html || "").toString();
     const desc = clamp(rawDesc.replace(/<[^>]+>/g, " "), 1000);
@@ -181,33 +217,39 @@ app.post("/webhook/products/create", async (req, res) => {
 
     const material = inferMaterial(combinedText);
     const tags = uniq([...(p.tags || "").split(",").map(t => t.trim()).filter(Boolean), ...inferTags(combinedText)]);
+    console.log("   • material:", material, "| tags:", tags.join(", "));
 
+    // Competitor pricing (optional)
     let benchPrice = null;
     if (SERPAPI_KEY) {
       const prices = await fetchCompetitorPrices(title);
       benchPrice = pickPriceFromCompetitors(prices);
+      console.log("   • competitor samples:", prices.slice(0,5), "| picked:", benchPrice);
     }
 
-    const { title: seoTitle, description: seoDescription } = seoFrom(title, desc);
-
-    // Run updates
+    // Unique SEO
+    const { title: seoTitle, description: seoDescription } = seoFrom(title, desc, material, tags);
     await updateProductSEO(p.admin_graphql_api_id, seoTitle, seoDescription);
 
+    // Tags via REST
     const productIdNum = Number(toNumericId(p.admin_graphql_api_id));
     await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, tags: tags.join(", ") } });
     console.log(`   ✔ Tags set (${tags.length})`);
 
+    // Variant pricing via REST
     const variants = Array.isArray(p.variants) ? p.variants : [];
     const isMoissanite = material === "s925+moissanite";
     for (const v of variants) {
       if (!v?.admin_graphql_api_id) continue;
+      const mm = parseLengthMM(v.title) || parseLengthMM(v.option1) || parseLengthMM(v.option2) || parseLengthMM(v.option3);
       let price;
-      if (isMoissanite) price = ladderPriceForMoissanite();
-      else if (benchPrice) price = benchPrice;
-      else price = fallbackPrice(material);
+      if (isMoissanite && mm)      price = ladderPriceForMoissanite(mm);
+      else if (benchPrice)         price = benchPrice;
+      else                         price = fallbackPrice(material);
       await updateVariantPriceREST(v.admin_graphql_api_id, price);
     }
 
+    // Metafield + collections + ALT text
     await setMaterialMetafield(p.admin_graphql_api_id, material);
     await addToCollectionIfExists(p.admin_graphql_api_id, "Necklaces");
     if (material === "s925+moissanite") await addToCollectionIfExists(p.admin_graphql_api_id, "Moissanite Jewelry");
@@ -221,9 +263,13 @@ app.post("/webhook/products/create", async (req, res) => {
   }
 });
 
+// Health check
 app.get("/", (req, res) => res.send("OK"));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Webhook server running on ${PORT}`));
+
+
 
 
 
