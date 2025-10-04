@@ -1,18 +1,14 @@
-// server.js — REST-first stable build (SEO + pricing + tags/collections/alt)
-// ENV required: SHOPIFY_SHOP, SHOPIFY_TOKEN
-// Optional: SERPAPI_KEY, USD_GBP
-
 import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
-const SHOP = process.env.SHOPIFY_SHOP;         // e.g. dtpjewellry.myshopify.com
-const TOKEN = process.env.SHOPIFY_TOKEN;       // Admin API token (shpat_…)
+const SHOP = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_TOKEN;
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
 
 if (!SHOP || !TOKEN) {
-  console.error("Missing SHOPIFY_SHOP or SHOPIFY_TOKEN env vars.");
+  console.error("❌ Missing SHOPIFY_SHOP or SHOPIFY_TOKEN env vars.");
   process.exit(1);
 }
 
@@ -26,8 +22,8 @@ const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 const toNumericId = (gid) => (gid ? String(gid).split("/").pop() : null);
 
 function seoFrom(title, description) {
-  const cleanTitle = clamp((title || "").replace(/\s+\|\s+.*/, ""), 60);
-  const metaDesc = clamp(description || "Luxury jewelry by DTP Jewelry.", 160);
+  const cleanTitle = clamp(title || "Luxury Jewelry by DTP Jewelry", 60);
+  const metaDesc = clamp(description || "Luxury jewelry handcrafted by DTP Jewelry.", 160);
   return { title: cleanTitle, description: metaDesc };
 }
 
@@ -37,7 +33,6 @@ function inferMaterial(text) {
   if (/\bs925\b/.test(s) || /sterling silver/.test(s)) return "s925+plain";
   if (/stainless/.test(s)) return "steel+plain";
   if (/crystal|quartz|agate|stone|amethyst|opal|carnelian|tiger'?s eye/.test(s)) return "alloy+stone";
-  if (/alloy|zinc alloy|copper alloy|plated/.test(s)) return "alloy+stone";
   return "alloy+stone";
 }
 
@@ -52,35 +47,21 @@ function inferTags(text) {
   if (/tree of life/.test(s)) { tags.add("tree-of-life"); tags.add("spiritual"); }
   if (/moissanite/.test(s)) tags.add("moissanite");
   if (/\bs925\b|sterling/.test(s)) { tags.add("s925"); tags.add("sterling-silver"); }
-  if (/stainless/.test(s)) tags.add("stainless-steel");
-  if (/crystal|stone|quartz|agate|opal|amethyst|carnelian|tiger'?s eye/.test(s)) { tags.add("crystal"); tags.add("stone"); tags.add("gift"); }
   return Array.from(tags);
-}
-
-function parseLengthMM(str) {
-  if (!str) return null;
-  const s = String(str).toLowerCase();
-  const mm = s.match(/\b(4[0-9]{2}|5[0-9]{2})\s*mm\b/); // 450–599 mm
-  if (mm) return parseInt(mm[1], 10);
-  const cm = s.match(/\b(4[0-9]|5[0-9])\s*cm\b/);       // 40–59 cm
-  if (cm) return parseInt(cm[1], 10) * 10;
-  const inch = s.match(/\b(1[6-9]|2[0-2])\s*("|inch|in)\b/); // 16–22"
-  if (inch) return Math.round(parseFloat(inch[1]) * 25.4);
-  return null;
 }
 
 function ladderPriceForMoissanite(mm) {
   if (!mm) return 329.99;
-  if (mm <= 460) return 329.99;  // ~18"
-  if (mm <= 510) return 349.99;  // ~20"
-  return 369.99;                 // ~22"
+  if (mm <= 460) return 329.99;
+  if (mm <= 510) return 349.99;
+  return 369.99;
 }
 
 function fallbackPrice(material) {
   if (material === "s925+moissanite") return 329.99;
   if (material === "s925+plain") return 24.99;
   if (material === "steel+plain") return 14.99;
-  return 21.99; // alloy+stone default
+  return 21.99;
 }
 
 // ---------- competitor pricing ----------
@@ -101,7 +82,7 @@ function pickPriceFromCompetitors(prices) {
   if (!prices.length) return null;
   const s = [...prices].sort((a, b) => a - b);
   const med = s[Math.floor(s.length / 2)];
-  return parseFloat(round99(med * 1.1)); // median +10% premium
+  return parseFloat(round99(med * 1.1));
 }
 
 // ---------- REST + GraphQL helpers ----------
@@ -122,7 +103,6 @@ async function rest(path, method = "GET", body = null) {
   return res.json();
 }
 
-// SEO must be set via GraphQL (REST lacks SEO fields)
 async function updateProductSEO(productGid, title, description) {
   const API = `https://${SHOP}/admin/api/2024-07/graphql.json`;
   const mutation = `
@@ -139,13 +119,16 @@ async function updateProductSEO(productGid, title, description) {
   });
   const j = await r.json();
   if (j.errors || j.data?.productUpdate?.userErrors?.length) {
-    throw new Error("SEO update failed: " + JSON.stringify(j));
+    console.error("❌ SEO update failed:", JSON.stringify(j));
+  } else {
+    console.log("   ✔ SEO updated:", title);
   }
 }
 
 async function updateVariantPriceREST(variantGid, price) {
   const id = Number(toNumericId(variantGid));
   await rest(`variants/${id}.json`, "PUT", { variant: { id, price: String(price) } });
+  console.log(`   ✔ Variant ${id} -> £${price}`);
 }
 
 async function setAltTextIfMissing(productGid, altBase) {
@@ -155,17 +138,18 @@ async function setAltTextIfMissing(productGid, altBase) {
   for (const img of images) {
     if (!img.alt || img.alt.trim() === "") {
       await rest(`products/${productId}/images/${img.id}.json`, "PUT", { image: { id: img.id, alt: altBase } });
+      console.log(`   ✔ ALT text set for image ${img.id}`);
     }
   }
 }
 
 async function addToCollectionIfExists(productGid, title) {
-  if (!title) return;
   const productId = Number(toNumericId(productGid));
   const col = await rest(`custom_collections.json?title=${encodeURIComponent(title)}&limit=1`);
   const found = col?.custom_collections?.[0];
   if (found?.id) {
     await rest("collects.json", "POST", { collect: { product_id: productId, collection_id: found.id } });
+    console.log(`   ✔ Added to collection: ${title}`);
   }
 }
 
@@ -181,6 +165,7 @@ async function setMaterialMetafield(productGid, material) {
       value: material
     }
   });
+  console.log(`   ✔ Metafield (dtp.material) = ${material}`);
 }
 
 // ---------- webhook ----------
@@ -194,47 +179,41 @@ app.post("/webhook/products/create", async (req, res) => {
     const title = p.title || "";
     const combinedText = `${title} ${desc}`;
 
-    // Infer
     const material = inferMaterial(combinedText);
     const tags = uniq([...(p.tags || "").split(",").map(t => t.trim()).filter(Boolean), ...inferTags(combinedText)]);
 
-    // Competitor price (optional)
     let benchPrice = null;
     if (SERPAPI_KEY) {
       const prices = await fetchCompetitorPrices(title);
       benchPrice = pickPriceFromCompetitors(prices);
     }
 
-    // 1) SEO (GraphQL)
     const { title: seoTitle, description: seoDescription } = seoFrom(title, desc);
+
+    // Run updates
     await updateProductSEO(p.admin_graphql_api_id, seoTitle, seoDescription);
 
-    // 2) Tags (REST)
     const productIdNum = Number(toNumericId(p.admin_graphql_api_id));
     await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, tags: tags.join(", ") } });
+    console.log(`   ✔ Tags set (${tags.length})`);
 
-    // 3) Variant prices (REST)
     const variants = Array.isArray(p.variants) ? p.variants : [];
     const isMoissanite = material === "s925+moissanite";
     for (const v of variants) {
       if (!v?.admin_graphql_api_id) continue;
-
-      let mm = parseLengthMM(v.title) || parseLengthMM(v.option1) || parseLengthMM(v.option2) || parseLengthMM(v.option3);
       let price;
-      if (isMoissanite && mm) price = ladderPriceForMoissanite(mm);
+      if (isMoissanite) price = ladderPriceForMoissanite();
       else if (benchPrice) price = benchPrice;
       else price = fallbackPrice(material);
-
       await updateVariantPriceREST(v.admin_graphql_api_id, price);
     }
 
-    // 4) Metafield + collections + image alts
     await setMaterialMetafield(p.admin_graphql_api_id, material);
     await addToCollectionIfExists(p.admin_graphql_api_id, "Necklaces");
     if (material === "s925+moissanite") await addToCollectionIfExists(p.admin_graphql_api_id, "Moissanite Jewelry");
     await setAltTextIfMissing(p.admin_graphql_api_id, `${seoTitle} by DTP Jewelry`);
 
-    console.log(`✅ Updated "${title}" | material=${material} | tags=${tags.length}`);
+    console.log(`✅ Finished "${title}"`);
     res.sendStatus(200);
   } catch (e) {
     console.error("❌ Webhook error:", e);
@@ -242,9 +221,9 @@ app.post("/webhook/products/create", async (req, res) => {
   }
 });
 
-// Health check
 app.get("/", (req, res) => res.send("OK"));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Webhook server running on ${PORT}`));
+
+
 
