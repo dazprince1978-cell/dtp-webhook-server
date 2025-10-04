@@ -1,5 +1,4 @@
 // server.js — REST-first stable build (SEO + pricing + tags/collections/alt)
-// Node 18+
 // ENV required: SHOPIFY_SHOP, SHOPIFY_TOKEN
 // Optional: SERPAPI_KEY, USD_GBP
 
@@ -8,7 +7,7 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
 const SHOP = process.env.SHOPIFY_SHOP;         // e.g. dtpjewellry.myshopify.com
-const TOKEN = process.env.SHOPIFY_TOKEN;       // Admin API token (shpat_...)
+const TOKEN = process.env.SHOPIFY_TOKEN;       // Admin API token (shpat_…)
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const USD_GBP = parseFloat(process.env.USD_GBP || "0.78");
 
@@ -24,6 +23,7 @@ app.use(bodyParser.json({ type: "*/*" }));
 const clamp = (s, n) => (s || "").toString().trim().replace(/\s+/g, " ").slice(0, n);
 const round99 = (n) => (Math.max(0, Math.round(n)) + 0.99).toFixed(2);
 const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
+const toNumericId = (gid) => (gid ? String(gid).split("/").pop() : null);
 
 function seoFrom(title, description) {
   const cleanTitle = clamp((title || "").replace(/\s+\|\s+.*/, ""), 60);
@@ -104,7 +104,7 @@ function pickPriceFromCompetitors(prices) {
   return parseFloat(round99(med * 1.1)); // median +10% premium
 }
 
-// ---------- REST helpers ----------
+// ---------- REST + GraphQL helpers ----------
 async function rest(path, method = "GET", body = null) {
   const url = `https://${SHOP}/admin/api/2024-07/${path}`;
   const res = await fetch(url, {
@@ -122,10 +122,9 @@ async function rest(path, method = "GET", body = null) {
   return res.json();
 }
 
-async function updateProductSEO(productId, title, description) {
-  // REST doesn't set SEO meta directly; use GraphQL for SEO only (safe)
+// SEO must be set via GraphQL (REST lacks SEO fields)
+async function updateProductSEO(productGid, title, description) {
   const API = `https://${SHOP}/admin/api/2024-07/graphql.json`;
-  const seo = { title, description };
   const mutation = `
     mutation($input: ProductInput!) {
       productUpdate(input: $input) {
@@ -136,7 +135,7 @@ async function updateProductSEO(productId, title, description) {
   const r = await fetch(API, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN },
-    body: JSON.stringify({ query: mutation, variables: { input: { id: productId, seo } } })
+    body: JSON.stringify({ query: mutation, variables: { input: { id: productGid, seo: { title, description } } } })
   });
   const j = await r.json();
   if (j.errors || j.data?.productUpdate?.userErrors?.length) {
@@ -145,11 +144,12 @@ async function updateProductSEO(productId, title, description) {
 }
 
 async function updateVariantPriceREST(variantGid, price) {
-  const numericId = String(variantGid).split("/").pop(); // gid://shopify/ProductVariant/123
-  await rest(`variants/${numericId}.json`, "PUT", { variant: { id: Number(numericId), price: String(price) } });
+  const id = Number(toNumericId(variantGid));
+  await rest(`variants/${id}.json`, "PUT", { variant: { id, price: String(price) } });
 }
 
-async function setAltTextIfMissing(productId, altBase) {
+async function setAltTextIfMissing(productGid, altBase) {
+  const productId = Number(toNumericId(productGid));
   const data = await rest(`products/${productId}.json`);
   const images = data?.product?.images || [];
   for (const img of images) {
@@ -159,20 +159,21 @@ async function setAltTextIfMissing(productId, altBase) {
   }
 }
 
-async function addToCollectionIfExists(productId, title) {
+async function addToCollectionIfExists(productGid, title) {
   if (!title) return;
-  // Find collection by title (custom collections only via REST)
+  const productId = Number(toNumericId(productGid));
   const col = await rest(`custom_collections.json?title=${encodeURIComponent(title)}&limit=1`);
   const found = col?.custom_collections?.[0];
   if (found?.id) {
-    await rest("collects.json", "POST", { collect: { product_id: Number(String(productId).split("/").pop()), collection_id: found.id } });
+    await rest("collects.json", "POST", { collect: { product_id: productId, collection_id: found.id } });
   }
 }
 
-async function setMaterialMetafield(productId, material) {
+async function setMaterialMetafield(productGid, material) {
+  const owner_id = Number(toNumericId(productGid));
   await rest("metafields.json", "POST", {
     metafield: {
-      owner_id: Number(String(productId).split("/").pop()),
+      owner_id,
       owner_resource: "product",
       namespace: "dtp",
       key: "material",
@@ -196,7 +197,6 @@ app.post("/webhook/products/create", async (req, res) => {
     // Infer
     const material = inferMaterial(combinedText);
     const tags = uniq([...(p.tags || "").split(",").map(t => t.trim()).filter(Boolean), ...inferTags(combinedText)]);
-    const collections = ["Necklaces", ...inferTags(combinedText).includes("moissanite") ? ["Moissanite Jewelry"] : []];
 
     // Competitor price (optional)
     let benchPrice = null;
@@ -205,15 +205,15 @@ app.post("/webhook/products/create", async (req, res) => {
       benchPrice = pickPriceFromCompetitors(prices);
     }
 
-    // 1) SEO
+    // 1) SEO (GraphQL)
     const { title: seoTitle, description: seoDescription } = seoFrom(title, desc);
     await updateProductSEO(p.admin_graphql_api_id, seoTitle, seoDescription);
 
-    // 2) Tags via REST
-    const productIdNum = Number(String(p.admin_graphql_api_id).split("/").pop());
+    // 2) Tags (REST)
+    const productIdNum = Number(toNumericId(p.admin_graphql_api_id));
     await rest(`products/${productIdNum}.json`, "PUT", { product: { id: productIdNum, tags: tags.join(", ") } });
 
-    // 3) Variant prices via REST
+    // 3) Variant prices (REST)
     const variants = Array.isArray(p.variants) ? p.variants : [];
     const isMoissanite = material === "s925+moissanite";
     for (const v of variants) {
@@ -242,7 +242,7 @@ app.post("/webhook/products/create", async (req, res) => {
   }
 });
 
-// Optional health check
+// Health check
 app.get("/", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 3000;
